@@ -1,4 +1,5 @@
-import json
+import re
+import time
 from typing import Callable
 
 import anthropic
@@ -28,10 +29,13 @@ EFFORT = "medium"
 MAX_DIRECT_TOKENS = 100_000
 CHUNK_TOKENS = 60_000
 
-# Both are free-tier models; the second is used when the first is overloaded or out of quota.
-GEMINI_MODELS = ["gemini-4-hydrogen", "gemini-3.8-flash"]
+# Both are free-tier models; the second is used when the first is overloaded, slow, or out of quota.
+# gemini-4-hydrogen was left out: on the free tier it took minutes just to answer "high demand".
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
 GEMINI_MAX_DIRECT_CHARS = 300_000
 GEMINI_CHUNK_CHARS = 120_000
+GEMINI_TIMEOUT_SECONDS = 180
+GEMINI_MAX_OUTPUT_TOKENS = 32_000
 
 SYSTEM_PROMPT = """당신은 스포츠 경영·스포츠 산업·팬 문화·스포츠 통계 분야의 학술 논문을 분석하는 연구 조교입니다. 사용자는 이 분야의 대학원생입니다.
 
@@ -106,14 +110,13 @@ CONDENSE_PROMPT = """아래는 긴 논문을 {n}개로 나눈 것 중 {i}번째 
 {chunk}
 </part>"""
 
-GEMINI_PROMPT = "아래 네 항목을 모두 작성해 JSON으로 답하세요. 각 값은 해당 지시를 따른 마크다운 문자열입니다.\n\n" + "\n\n".join(
-    f"[{key}: {title}]\n{instruction}" for key, title, instruction in SECTIONS
+# Plain-text sections split by marker lines, so a partly malformed answer still yields the sections it has.
+GEMINI_PROMPT = (
+    "아래 네 항목을 순서대로 모두 작성하세요. 각 항목은 반드시 구분자 한 줄(예: <<<summary>>>)로 시작하고, "
+    "그다음 줄부터 지시된 형식의 마크다운을 쓰세요. 구분자 줄에는 다른 글자를 쓰지 마세요.\n\n"
+    + "\n\n".join(f"<<<{key}>>> ({title})\n{instruction}" for key, title, instruction in SECTIONS)
 )
-GEMINI_SCHEMA = {
-    "type": "object",
-    "properties": {key: {"type": "string"} for key, _, _ in SECTIONS},
-    "required": [key for key, _, _ in SECTIONS],
-}
+GEMINI_MARKER = re.compile(r"^\s*<<<(" + "|".join(key for key, _, _ in SECTIONS) + r")>>>.*$", re.MULTILINE)
 
 ProgressCallback = Callable[[str, float], None]
 API_ERRORS = (anthropic.APIError, gemini_errors.APIError)
@@ -157,6 +160,8 @@ def _friendly_gemini_error(e: gemini_errors.APIError) -> str:
         isinstance(e, gemini_errors.BadRequestError) and "API key" in str(e)
     ):
         return "무료 모드 설정(서버의 Gemini 키)에 문제가 있습니다. 앱 관리자에게 알려 주세요."
+    if isinstance(e, gemini_errors.APITimeoutError):
+        return "무료 모델의 응답이 너무 오래 걸려 중단했습니다. 잠시 뒤 다시 시도해 주세요."
     if isinstance(e, gemini_errors.APIConnectionError):
         return "Google 서버에 연결하지 못했습니다. 잠시 뒤 다시 시도해 주세요."
     if isinstance(e, gemini_errors.APIStatusError) and e.status_code >= 500:
@@ -286,17 +291,14 @@ class GeminiAnalyzer:
             document = _condense(text, GEMINI_CHUNK_CHARS, self._ask, on_progress)
 
         on_progress("네 항목을 한꺼번에 분석하는 중... (보통 1~3분)", 0.3)
-        answer = self._ask(f"<paper>\n{document}\n</paper>\n\n{GEMINI_PROMPT}", GEMINI_SCHEMA)
-        try:
-            data = json.loads(answer)
-        except json.JSONDecodeError:
-            data = {}
+        answer = self._ask(f"<paper>\n{document}\n</paper>\n\n{GEMINI_PROMPT}")
+        parts = GEMINI_MARKER.split(answer)
+        found = {parts[i]: parts[i + 1].strip() for i in range(1, len(parts) - 1, 2)}
 
         results = {}
         for key, _, _ in SECTIONS:
-            value = data.get(key) if isinstance(data, dict) else None
-            if isinstance(value, str) and value.strip():
-                results[key] = {"text": value.strip(), "error": None}
+            if found.get(key):
+                results[key] = {"text": found[key], "error": None}
             else:
                 results[key] = {"text": None, "error": "이 항목의 결과를 받지 못했습니다. 다시 분석해 보세요."}
         on_progress("완료", 1.0)
@@ -305,29 +307,38 @@ class GeminiAnalyzer:
     def estimated_cost(self) -> float:
         return 0.0
 
-    def _ask(self, prompt: str, schema: dict | None = None) -> str:
-        kwargs = {
-            "input": prompt,
-            "system_instruction": SYSTEM_PROMPT,
-            "generation_config": {"max_output_tokens": 64000},
-        }
-        if schema:
-            kwargs["response_format"] = {"type": "text", "mime_type": "application/json", "schema": schema}
-
+    def _ask(self, prompt: str) -> str:
         candidates = GEMINI_MODELS[GEMINI_MODELS.index(self.model):]
         for i, model in enumerate(candidates):
+            started = time.monotonic()
             try:
-                interaction = self.client.interactions.create(model=model, **kwargs)
+                interaction = self.client.interactions.create(
+                    model=model,
+                    input=prompt,
+                    system_instruction=SYSTEM_PROMPT,
+                    generation_config={"max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS},
+                    timeout=GEMINI_TIMEOUT_SECONDS,
+                )
                 self.model = model
                 break
-            except gemini_errors.APIStatusError as e:
-                overloaded = e.status_code == 429 or e.status_code >= 500
-                if not overloaded or i == len(candidates) - 1:
+            except (gemini_errors.APIStatusError, gemini_errors.APITimeoutError) as e:
+                timed_out = isinstance(e, gemini_errors.APITimeoutError)
+                code = "timeout" if timed_out else e.status_code
+                print(f"[gemini] model={model} error={code} seconds={time.monotonic() - started:.0f}", flush=True)
+                retryable = timed_out or code == 429 or code >= 500
+                if not retryable or i == len(candidates) - 1:
                     raise
 
-        if interaction.usage:
-            self.usage["input"] += interaction.usage.total_input_tokens or 0
-            self.usage["output"] += interaction.usage.total_output_tokens or 0
+        u = interaction.usage
+        print(
+            f"[gemini] model={model} status={interaction.status} seconds={time.monotonic() - started:.0f} "
+            f"input={u.total_input_tokens if u else None} output={u.total_output_tokens if u else None} "
+            f"thought={u.total_thought_tokens if u else None}",
+            flush=True,
+        )
+        if u:
+            self.usage["input"] += u.total_input_tokens or 0
+            self.usage["output"] += u.total_output_tokens or 0
         if interaction.status == "incomplete":
             raise AnalysisError("응답이 길이 제한에 걸려 잘렸습니다. 다시 분석해 보세요.")
         if interaction.status != "completed":
