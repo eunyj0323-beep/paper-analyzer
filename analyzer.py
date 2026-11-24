@@ -4,6 +4,7 @@ from typing import Callable
 import anthropic
 from google import genai
 from google.genai import _interactions_errors as gemini_errors  # Interactions API errors aren't re-exported publicly
+from google.genai import types as gemini_types
 
 from pdf_processor import chunk_text, split_references
 
@@ -27,8 +28,8 @@ EFFORT = "medium"
 MAX_DIRECT_TOKENS = 100_000
 CHUNK_TOKENS = 60_000
 
-GEMINI_MODEL = "gemini-4-hydrogen"
-GEMINI_LABEL = "Google Gemini (무료 모드)"
+# Both are free-tier models; the second is used when the first is overloaded or out of quota.
+GEMINI_MODELS = ["gemini-4-hydrogen", "gemini-3.8-flash"]
 GEMINI_MAX_DIRECT_CHARS = 300_000
 GEMINI_CHUNK_CHARS = 120_000
 
@@ -158,8 +159,10 @@ def _friendly_gemini_error(e: gemini_errors.APIError) -> str:
         return "무료 모드 설정(서버의 Gemini 키)에 문제가 있습니다. 앱 관리자에게 알려 주세요."
     if isinstance(e, gemini_errors.APIConnectionError):
         return "Google 서버에 연결하지 못했습니다. 잠시 뒤 다시 시도해 주세요."
+    if isinstance(e, gemini_errors.APIStatusError) and e.status_code >= 500:
+        return "Google 무료 모델이 지금 붐벼서 분석하지 못했습니다. 몇 분 뒤 다시 시도해 주세요."
     if isinstance(e, gemini_errors.APIStatusError):
-        return f"Gemini API 오류 ({e.status_code}): {getattr(e, 'message', e)}"
+        return f"Gemini API 오류 ({e.status_code}). 잠시 뒤 다시 시도해 주세요."
     return f"Gemini API 오류: {e}"
 
 
@@ -263,12 +266,17 @@ class ClaudeAnalyzer:
 
 class GeminiAnalyzer:
     # One request for all four sections, to stay within the free tier's request and token quotas.
-    label = GEMINI_LABEL
 
     def __init__(self, api_key: str):
-        self.client = genai.Client(api_key=api_key)
+        retries = gemini_types.HttpRetryOptions(attempts=2)
+        self.client = genai.Client(api_key=api_key, http_options=gemini_types.HttpOptions(retry_options=retries))
+        self.model = GEMINI_MODELS[0]
         self.usage = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
         self.chunked = False
+
+    @property
+    def label(self) -> str:
+        return f"Google Gemini 무료 모드 ({self.model})"
 
     def analyze(self, text: str, on_progress: ProgressCallback) -> dict:
         on_progress("논문 길이를 확인하는 중...", 0.02)
@@ -299,7 +307,6 @@ class GeminiAnalyzer:
 
     def _ask(self, prompt: str, schema: dict | None = None) -> str:
         kwargs = {
-            "model": GEMINI_MODEL,
             "input": prompt,
             "system_instruction": SYSTEM_PROMPT,
             "generation_config": {"max_output_tokens": 64000},
@@ -307,7 +314,16 @@ class GeminiAnalyzer:
         if schema:
             kwargs["response_format"] = {"type": "text", "mime_type": "application/json", "schema": schema}
 
-        interaction = self.client.interactions.create(**kwargs)
+        candidates = GEMINI_MODELS[GEMINI_MODELS.index(self.model):]
+        for i, model in enumerate(candidates):
+            try:
+                interaction = self.client.interactions.create(model=model, **kwargs)
+                self.model = model
+                break
+            except gemini_errors.APIStatusError as e:
+                overloaded = e.status_code == 429 or e.status_code >= 500
+                if not overloaded or i == len(candidates) - 1:
+                    raise
 
         if interaction.usage:
             self.usage["input"] += interaction.usage.total_input_tokens or 0

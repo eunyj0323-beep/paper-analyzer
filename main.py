@@ -7,7 +7,6 @@ from dotenv import load_dotenv
 
 from analyzer import (
     API_ERRORS,
-    GEMINI_MODEL,
     MODELS,
     SECTIONS,
     AnalysisError,
@@ -50,7 +49,7 @@ with st.sidebar:
 if claude_key:
     engine = ("claude", model)
 elif gemini_key:
-    engine = ("gemini", GEMINI_MODEL)
+    engine = ("gemini", None)
 else:
     engine = None
 
