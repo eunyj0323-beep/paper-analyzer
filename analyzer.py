@@ -30,8 +30,8 @@ MAX_DIRECT_TOKENS = 100_000
 CHUNK_TOKENS = 60_000
 
 # Both are free-tier models; the second is used when the first is overloaded, slow, or out of quota.
-# gemini-4-hydrogen was left out: on the free tier it took minutes just to answer "high demand".
-GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
+# On the free tier flash-lite answered in seconds while gemini-3.8-flash (and gemini-4-hydrogen) took minutes.
+GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
 GEMINI_MAX_DIRECT_CHARS = 300_000
 GEMINI_CHUNK_CHARS = 120_000
 GEMINI_TIMEOUT_SECONDS = 180
