@@ -6,7 +6,7 @@ from docx import Document
 from docx.oxml.ns import qn
 from docx.shared import Pt
 
-from analyzer import MODELS, SECTIONS
+from analyzer import SECTIONS
 
 FONT = "맑은 고딕"
 
@@ -15,7 +15,7 @@ def to_markdown(result: dict) -> str:
     lines = [
         f"# 논문 분석 리포트: {result['filename']}",
         "",
-        f"- 분석 모델: {MODELS[result['model']]['label']}",
+        f"- 분석 모델: {result['model_label']}",
         f"- 분석 날짜: {date.today().isoformat()}",
     ]
     if result["chunked"]:
@@ -24,7 +24,7 @@ def to_markdown(result: dict) -> str:
         section = result["sections"][key]
         body = section["text"] if section["text"] else f"(분석 실패: {section['error']})"
         lines += ["", "---", "", f"## {n}. {title}", "", body]
-    lines += ["", "---", "", "*Claude가 자동으로 생성한 분석입니다. 인용 전 원문과 대조해 확인하세요.*", ""]
+    lines += ["", "---", "", "*AI가 자동으로 생성한 분석입니다. 인용 전 원문과 대조해 확인하세요.*", ""]
     return "\n".join(lines)
 
 

@@ -1,6 +1,9 @@
+import json
 from typing import Callable
 
 import anthropic
+from google import genai
+from google.genai import _interactions_errors as gemini_errors  # Interactions API errors aren't re-exported publicly
 
 from pdf_processor import chunk_text, split_references
 
@@ -23,6 +26,11 @@ MODELS = {
 EFFORT = "medium"
 MAX_DIRECT_TOKENS = 100_000
 CHUNK_TOKENS = 60_000
+
+GEMINI_MODEL = "gemini-4-hydrogen"
+GEMINI_LABEL = "Google Gemini (무료 모드)"
+GEMINI_MAX_DIRECT_CHARS = 300_000
+GEMINI_CHUNK_CHARS = 120_000
 
 SYSTEM_PROMPT = """당신은 스포츠 경영·스포츠 산업·팬 문화·스포츠 통계 분야의 학술 논문을 분석하는 연구 조교입니다. 사용자는 이 분야의 대학원생입니다.
 
@@ -97,14 +105,30 @@ CONDENSE_PROMPT = """아래는 긴 논문을 {n}개로 나눈 것 중 {i}번째 
 {chunk}
 </part>"""
 
+GEMINI_PROMPT = "아래 네 항목을 모두 작성해 JSON으로 답하세요. 각 값은 해당 지시를 따른 마크다운 문자열입니다.\n\n" + "\n\n".join(
+    f"[{key}: {title}]\n{instruction}" for key, title, instruction in SECTIONS
+)
+GEMINI_SCHEMA = {
+    "type": "object",
+    "properties": {key: {"type": "string"} for key, _, _ in SECTIONS},
+    "required": [key for key, _, _ in SECTIONS],
+}
+
 ProgressCallback = Callable[[str, float], None]
+API_ERRORS = (anthropic.APIError, gemini_errors.APIError)
 
 
-class RefusalError(Exception):
+class AnalysisError(Exception):
     pass
 
 
-def friendly_error(e: anthropic.APIError) -> str:
+class RefusalError(AnalysisError):
+    pass
+
+
+def friendly_error(e: Exception) -> str:
+    if isinstance(e, gemini_errors.APIError):
+        return _friendly_gemini_error(e)
     if isinstance(e, anthropic.AuthenticationError):
         return "API 키가 올바르지 않습니다. 키를 다시 확인해 주세요."
     if isinstance(e, anthropic.PermissionDeniedError):
@@ -122,10 +146,42 @@ def friendly_error(e: anthropic.APIError) -> str:
     return f"Claude API 오류: {e}"
 
 
-class PaperAnalyzer:
+def _friendly_gemini_error(e: gemini_errors.APIError) -> str:
+    if isinstance(e, gemini_errors.RateLimitError):
+        return (
+            "무료 모드 사용 한도를 넘었습니다. 1분 뒤 다시 시도해 보고, 계속 안 되면 오늘 한도가 다 찬 것입니다"
+            "(한국 시간 오후 4~5시에 초기화). 본인 Claude API 키를 넣으면 바로 분석할 수 있습니다."
+        )
+    if isinstance(e, (gemini_errors.AuthenticationError, gemini_errors.PermissionDeniedError)) or (
+        isinstance(e, gemini_errors.BadRequestError) and "API key" in str(e)
+    ):
+        return "무료 모드 설정(서버의 Gemini 키)에 문제가 있습니다. 앱 관리자에게 알려 주세요."
+    if isinstance(e, gemini_errors.APIConnectionError):
+        return "Google 서버에 연결하지 못했습니다. 잠시 뒤 다시 시도해 주세요."
+    if isinstance(e, gemini_errors.APIStatusError):
+        return f"Gemini API 오류 ({e.status_code}): {getattr(e, 'message', e)}"
+    return f"Gemini API 오류: {e}"
+
+
+def _condense(text: str, chunk_chars: int, ask: Callable[[str], str], on_progress: ProgressCallback) -> str:
+    body, references = split_references(text)
+    chunks = chunk_text(body, chunk_chars)
+    notes = []
+    for i, chunk in enumerate(chunks, 1):
+        on_progress(f"긴 논문이라 나눠서 읽는 중... ({i}/{len(chunks)})", 0.02 + 0.18 * i / len(chunks))
+        notes.append(f"## 부분 {i} 노트\n{ask(CONDENSE_PROMPT.format(n=len(chunks), i=i, chunk=chunk))}")
+
+    document = "[분량이 많아 본문을 부분별로 압축한 노트입니다]\n\n" + "\n\n".join(notes)
+    if references:
+        document += f"\n\n[참고문헌 원문]\n{references}"
+    return document
+
+
+class ClaudeAnalyzer:
     def __init__(self, api_key: str, model: str):
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
+        self.label = MODELS[model]["label"]
         self.usage = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
         self.chunked = False
 
@@ -172,21 +228,9 @@ class PaperAnalyzer:
         ).input_tokens
         if tokens <= MAX_DIRECT_TOKENS:
             return text
-
         self.chunked = True
-        body, references = split_references(text)
         chunk_chars = int(CHUNK_TOKENS * len(text) / tokens)
-        chunks = chunk_text(body, chunk_chars)
-        notes = []
-        for i, chunk in enumerate(chunks, 1):
-            on_progress(f"긴 논문이라 나눠서 읽는 중... ({i}/{len(chunks)})", 0.02 + 0.18 * i / len(chunks))
-            prompt = CONDENSE_PROMPT.format(n=len(chunks), i=i, chunk=chunk)
-            notes.append(f"## 부분 {i} 노트\n{self._ask(SYSTEM_PROMPT, prompt)}")
-
-        document = "[분량이 많아 본문을 부분별로 압축한 노트입니다]\n\n" + "\n\n".join(notes)
-        if references:
-            document += f"\n\n[참고문헌 원문]\n{references}"
-        return document
+        return _condense(text, chunk_chars, lambda prompt: self._ask(SYSTEM_PROMPT, prompt), on_progress)
 
     def _ask(self, system: str, content) -> str:
         kwargs = {
@@ -215,3 +259,61 @@ class PaperAnalyzer:
         if message.stop_reason == "max_tokens":
             answer += "\n\n> 응답이 길이 제한에 걸려 중간에 잘렸습니다."
         return answer
+
+
+class GeminiAnalyzer:
+    # One request for all four sections, to stay within the free tier's request and token quotas.
+    label = GEMINI_LABEL
+
+    def __init__(self, api_key: str):
+        self.client = genai.Client(api_key=api_key)
+        self.usage = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
+        self.chunked = False
+
+    def analyze(self, text: str, on_progress: ProgressCallback) -> dict:
+        on_progress("논문 길이를 확인하는 중...", 0.02)
+        document = text
+        if len(text) > GEMINI_MAX_DIRECT_CHARS:
+            self.chunked = True
+            document = _condense(text, GEMINI_CHUNK_CHARS, self._ask, on_progress)
+
+        on_progress("네 항목을 한꺼번에 분석하는 중... (보통 1~3분)", 0.3)
+        answer = self._ask(f"<paper>\n{document}\n</paper>\n\n{GEMINI_PROMPT}", GEMINI_SCHEMA)
+        try:
+            data = json.loads(answer)
+        except json.JSONDecodeError:
+            data = {}
+
+        results = {}
+        for key, _, _ in SECTIONS:
+            value = data.get(key) if isinstance(data, dict) else None
+            if isinstance(value, str) and value.strip():
+                results[key] = {"text": value.strip(), "error": None}
+            else:
+                results[key] = {"text": None, "error": "이 항목의 결과를 받지 못했습니다. 다시 분석해 보세요."}
+        on_progress("완료", 1.0)
+        return results
+
+    def estimated_cost(self) -> float:
+        return 0.0
+
+    def _ask(self, prompt: str, schema: dict | None = None) -> str:
+        kwargs = {
+            "model": GEMINI_MODEL,
+            "input": prompt,
+            "system_instruction": SYSTEM_PROMPT,
+            "generation_config": {"max_output_tokens": 64000},
+        }
+        if schema:
+            kwargs["response_format"] = {"type": "text", "mime_type": "application/json", "schema": schema}
+
+        interaction = self.client.interactions.create(**kwargs)
+
+        if interaction.usage:
+            self.usage["input"] += interaction.usage.total_input_tokens or 0
+            self.usage["output"] += interaction.usage.total_output_tokens or 0
+        if interaction.status == "incomplete":
+            raise AnalysisError("응답이 길이 제한에 걸려 잘렸습니다. 다시 분석해 보세요.")
+        if interaction.status != "completed":
+            raise AnalysisError(f"Gemini가 분석을 끝내지 못했습니다 (상태: {interaction.status}). 다시 시도해 주세요.")
+        return (interaction.output_text or "").strip()
