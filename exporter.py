@@ -1,6 +1,5 @@
 import io
 import re
-from datetime import date
 
 from docx import Document
 from docx.oxml.ns import qn
@@ -9,22 +8,52 @@ from docx.shared import Pt
 from analyzer import SECTIONS
 
 FONT = "맑은 고딕"
+FOOTER = "*AI가 자동으로 생성한 분석입니다. 인용 전 원문과 대조해 확인하세요.*"
 
 
-def to_markdown(result: dict) -> str:
-    lines = [
-        f"# 논문 분석 리포트: {result['filename']}",
-        "",
-        f"- 분석 모델: {result['model_label']}",
-        f"- 분석 날짜: {date.today().isoformat()}",
+def to_markdown(report: dict) -> str:
+    if report["kind"] == "compare":
+        return _compare_markdown(report)
+    meta = report["meta"]
+    lines = [f"# 논문 분석 리포트: {meta['title'] or report['filename']}", ""]
+    if meta["authors"] or meta["year"]:
+        lines.append(f"- 저자·연도: {meta['authors']} ({meta['year'] or '연도 미상'})")
+    lines += [
+        f"- 파일: {report['filename']}",
+        f"- 분야: {meta['category']} · 연구유형: {meta['design']}",
     ]
-    if result["chunked"]:
+    if meta["keywords"]:
+        lines.append(f"- 키워드: {', '.join(meta['keywords'])}")
+    if report.get("tags"):
+        lines.append(f"- 내 태그: {', '.join(report['tags'])}")
+    lines += [
+        f"- 분석 모델: {report['model_label']}",
+        f"- 분석 날짜: {report['created'][:10]}",
+    ]
+    if report["chunked"]:
         lines.append("- 분량이 많아 본문을 나눠 압축한 뒤 분석했습니다.")
+    if report.get("pdf_mode"):
+        lines.append("- PDF에서 글자를 뽑을 수 없어 AI가 PDF 파일을 직접 읽고 분석했습니다.")
     for n, (key, title, _) in enumerate(SECTIONS, 1):
-        section = result["sections"][key]
+        section = report["sections"][key]
         body = section["text"] if section["text"] else f"(분석 실패: {section['error']})"
         lines += ["", "---", "", f"## {n}. {title}", "", body]
-    lines += ["", "---", "", "*AI가 자동으로 생성한 분석입니다. 인용 전 원문과 대조해 확인하세요.*", ""]
+    lines += ["", "---", "", FOOTER, ""]
+    return "\n".join(lines)
+
+
+def _compare_markdown(report: dict) -> str:
+    lines = ["# 논문 비교 리포트", ""]
+    for n, title in enumerate(report["paper_titles"], 1):
+        lines.append(f"- 논문 {n}: {title}")
+    lines += [
+        f"- 분석 모델: {report['model_label']}",
+        f"- 분석 날짜: {report['created'][:10]}",
+        "- 각 논문의 분석 리포트를 바탕으로 비교했습니다.",
+        "", "---", "",
+        report["compare_text"],
+        "", "---", "", FOOTER, "",
+    ]
     return "\n".join(lines)
 
 

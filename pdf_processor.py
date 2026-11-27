@@ -2,6 +2,7 @@ import io
 import re
 
 import pdfplumber
+import pymupdf
 
 REFERENCE_HEADING = re.compile(
     r"^\s*(?:[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVX\d]+[.)]\s*)?"
@@ -10,14 +11,32 @@ REFERENCE_HEADING = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+MIN_TEXT_CHARS = 200
+# Scanned or garbled PDFs are sent to the AI as a file instead; these keep that request within API limits.
+MAX_PDF_PAGES = 100
+MAX_PDF_MB = 20
+
 
 def extract_text(pdf_bytes: bytes) -> tuple[str, int]:
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        pages = [page.extract_text() or "" for page in pdf.pages]
-    text = "\n".join(pages).replace("\x00", "")
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip(), len(pages)
+    """Return the better of pdfplumber's and PyMuPDF's text, plus the page count.
+
+    Raises ValueError when neither library can open the file.
+    """
+    candidates = []
+    for extractor in (_extract_pdfplumber, _extract_pymupdf):
+        try:
+            candidates.append(extractor(pdf_bytes))
+        except Exception:
+            continue
+    if not candidates:
+        raise ValueError("PDF 파일을 열 수 없습니다. 파일이 손상되었거나 암호가 걸려 있을 수 있습니다.")
+    text, pages = max(candidates, key=lambda c: _readable_chars(c[0]))
+    return _clean(text), pages
+
+
+def is_readable(text: str) -> bool:
+    """False for scanned PDFs (almost no text) and PDFs whose fonts extract as garbage."""
+    return _readable_chars(text) >= MIN_TEXT_CHARS and _garbage_ratio(text) < 0.1
 
 
 def split_references(text: str) -> tuple[str, str]:
@@ -44,3 +63,33 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
         chunks.append(text[start:end].strip())
         start = end
     return [c for c in chunks if c]
+
+
+def _extract_pdfplumber(pdf_bytes: bytes) -> tuple[str, int]:
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        pages = [page.extract_text() or "" for page in pdf.pages]
+    return "\n".join(pages), len(pages)
+
+
+def _extract_pymupdf(pdf_bytes: bytes) -> tuple[str, int]:
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        pages = [page.get_text() for page in doc]
+    return "\n".join(pages), len(pages)
+
+
+def _clean(text: str) -> str:
+    text = text.replace("\x00", "")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _garbage_ratio(text: str) -> float:
+    if not text:
+        return 1.0
+    garbage = len(re.findall(r"\(cid:\d+\)", text)) * 8 + text.count("�")
+    return garbage / len(text)
+
+
+def _readable_chars(text: str) -> int:
+    return len(re.sub(r"\(cid:\d+\)|�|\s", "", text))
